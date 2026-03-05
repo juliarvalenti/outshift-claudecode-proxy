@@ -12,7 +12,6 @@ const PROXY_PORT = 8099;
 
 const DEFAULT_MODEL = "bedrock/global.anthropic.claude-sonnet-4-6";
 
-// Model mappings
 const MODEL_MAP = {
   "claude-haiku-4-5-20251001":
     "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0",
@@ -21,7 +20,17 @@ const MODEL_MAP = {
   "bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0": DEFAULT_MODEL,
 };
 
-// Parse command line args
+// Content block types that LiteLLM / Bedrock actually understand.
+// Everything else (thinking, redacted_thinking, server_tool_use,
+// web_search_tool_result, citations, etc.) gets stripped so the
+// proxy stays forward-compatible as Claude Code adds new beta features.
+const ALLOWED_CONTENT_BLOCK_TYPES = new Set([
+  "text",
+  "image",
+  "tool_use",
+  "tool_result",
+]);
+
 const VERBOSE =
   process.argv.includes("--verbose") || process.argv.includes("-v");
 const SUMMARY =
@@ -34,10 +43,12 @@ const RETRY_BASE_DELAY_MS = 200;
 const RETRYABLE_ERRORS = new Set(["ECONNRESET", "ETIMEDOUT", "EPIPE"]);
 let requestCounter = 0;
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 const safeParseJson = (value) => {
-  if (typeof value !== "string" || value.length === 0) {
-    return value;
-  }
+  if (typeof value !== "string" || value.length === 0) return value;
   try {
     return JSON.parse(value);
   } catch {
@@ -46,445 +57,357 @@ const safeParseJson = (value) => {
 };
 
 const ensureLogDir = () => {
-  if (!LOG_REQUESTS) {
-    return;
-  }
+  if (!LOG_REQUESTS) return;
   fs.mkdirSync(LOG_DIR, { recursive: true });
 };
 
 const writeJsonlLog = (entry, requestId) => {
-  if (!LOG_REQUESTS) {
-    return;
-  }
+  if (!LOG_REQUESTS) return;
   ensureLogDir();
   const filePath = path.join(LOG_DIR, `${requestId}.jsonl`);
   fs.appendFileSync(filePath, `${JSON.stringify(entry)}\n`);
 };
 
 const log = (message, ...args) => {
-  if (VERBOSE) {
-    console.log(message, ...args);
-  }
+  if (VERBOSE) console.log(message, ...args);
 };
 
-const info = (message, ...args) => {
-  console.log(message, ...args);
-};
+const info = (message, ...args) => console.log(message, ...args);
 
 const summary = (message, ...args) => {
-  if (SUMMARY && !VERBOSE) {
-    console.log(message, ...args);
-  }
+  if (SUMMARY && !VERBOSE) console.log(message, ...args);
 };
 
 const isRetryableError = (err) =>
   err && typeof err.code === "string" && RETRYABLE_ERRORS.has(err.code);
 
-const server = http.createServer((req, res) => {
-  if (VERBOSE) {
-    log(`\n${new Date().toISOString()} ${req.method} ${req.url}`);
+// ---------------------------------------------------------------------------
+// Request body sanitisation — each function returns true if it changed anything
+// ---------------------------------------------------------------------------
+
+function fixThinkingBudget(body) {
+  if (!body.thinking?.budget_tokens) return false;
+  const maxTokens = body.max_tokens || 32000;
+  if (body.thinking.budget_tokens < maxTokens) return false;
+
+  const old = body.thinking.budget_tokens;
+  body.thinking.budget_tokens = Math.floor(maxTokens * 0.75);
+  info(`🧠 Fixed thinking budget: ${old} → ${body.thinking.budget_tokens}`);
+  return true;
+}
+
+function removeUnsupportedTopLevelFields(body) {
+  let changed = false;
+  if (body.context_management) {
+    delete body.context_management;
+    info("🧹 Removed context_management");
+    changed = true;
+  }
+  return changed;
+}
+
+function removeSystemCacheControl(body) {
+  if (!Array.isArray(body.system)) return false;
+  let changed = false;
+  for (const entry of body.system) {
+    if (entry?.cache_control) {
+      delete entry.cache_control;
+      changed = true;
+    }
+  }
+  if (changed) info("🧹 Removed system cache_control fields");
+  return changed;
+}
+
+function removeToolDeferLoading(body) {
+  if (!Array.isArray(body.tools)) return false;
+  let changed = false;
+  for (const tool of body.tools) {
+    if (tool && "defer_loading" in tool) {
+      delete tool.defer_loading;
+      changed = true;
+    }
+    if (tool?.custom && "defer_loading" in tool.custom) {
+      delete tool.custom.defer_loading;
+      changed = true;
+    }
+  }
+  if (changed) info("🧹 Removed tools defer_loading fields");
+  return changed;
+}
+
+/**
+ * Strip every content block whose type is not in the whitelist.
+ * This catches thinking, redacted_thinking, server_tool_use,
+ * web_search_tool_result, citations, and any future beta types
+ * that LiteLLM / Bedrock would reject.
+ *
+ * Also strips nested tool_reference entries inside tool_result blocks
+ * and removes cache_control from individual content blocks.
+ */
+function stripNonStandardContentBlocks(body) {
+  if (!Array.isArray(body.messages)) return false;
+
+  let changed = false;
+  const cleaned = [];
+
+  for (const message of body.messages) {
+    if (!Array.isArray(message?.content)) {
+      cleaned.push(message);
+      continue;
+    }
+
+    const filteredContent = [];
+    for (const block of message.content) {
+      if (!block) continue;
+
+      // Drop blocks LiteLLM doesn't understand
+      if (!ALLOWED_CONTENT_BLOCK_TYPES.has(block.type)) {
+        changed = true;
+        continue;
+      }
+
+      // Inside tool_result blocks, strip nested non-standard types
+      if (block.type === "tool_result" && Array.isArray(block.content)) {
+        const before = block.content.length;
+        block.content = block.content.filter(
+          (item) => item && ALLOWED_CONTENT_BLOCK_TYPES.has(item.type),
+        );
+        if (block.content.length !== before) changed = true;
+        if (block.content.length === 0) {
+          // tool_result with no content left — keep it but with empty string
+          block.content = "";
+        }
+      }
+
+      // Strip cache_control on individual content blocks
+      if (block.cache_control) {
+        delete block.cache_control;
+        changed = true;
+      }
+
+      filteredContent.push(block);
+    }
+
+    // Drop messages that became empty after filtering
+    if (filteredContent.length === 0) {
+      changed = true;
+      continue;
+    }
+
+    message.content = filteredContent;
+    cleaned.push(message);
   }
 
-  // Parse the URL to strip beta query parameter
+  if (changed) {
+    body.messages = cleaned;
+    info("🧹 Stripped non-standard content blocks");
+  }
+  return changed;
+}
+
+/**
+ * Ensure every tool_use in an assistant message has a matching tool_result
+ * in the next user message, and vice-versa.  Orphans are removed.
+ */
+function sanitizeToolPairs(body) {
+  if (!Array.isArray(body.messages)) return false;
+
+  let changed = false;
+  const out = [];
+
+  for (let i = 0; i < body.messages.length; i++) {
+    const msg = body.messages[i];
+
+    // --- assistant: drop tool_use blocks with no matching tool_result ---
+    if (msg?.role === "assistant" && Array.isArray(msg.content)) {
+      const toolIds = msg.content
+        .filter((b) => b?.type === "tool_use" && b.id)
+        .map((b) => b.id);
+
+      if (toolIds.length > 0) {
+        const next = body.messages[i + 1];
+        const hasMatch =
+          next?.role === "user" &&
+          Array.isArray(next.content) &&
+          next.content.some(
+            (b) => b?.type === "tool_result" && toolIds.includes(b.tool_use_id),
+          );
+        if (!hasMatch) {
+          msg.content = msg.content.filter((b) => b?.type !== "tool_use");
+          changed = true;
+        }
+      }
+
+      if (msg.content.length === 0) {
+        changed = true;
+        continue; // drop empty assistant message
+      }
+      out.push(msg);
+      continue;
+    }
+
+    // --- user: drop tool_result blocks with no matching tool_use ---
+    if (msg?.role === "user" && Array.isArray(msg.content)) {
+      const prev = body.messages[i - 1];
+      const validIds = new Set(
+        prev?.role === "assistant" && Array.isArray(prev.content)
+          ? prev.content
+              .filter((b) => b?.type === "tool_use" && b.id)
+              .map((b) => b.id)
+          : [],
+      );
+
+      const before = msg.content.length;
+      msg.content = msg.content.filter(
+        (b) =>
+          b?.type !== "tool_result" ||
+          (b.tool_use_id && validIds.has(b.tool_use_id)),
+      );
+      if (msg.content.length !== before) changed = true;
+
+      if (msg.content.length === 0) {
+        changed = true;
+        continue;
+      }
+      out.push(msg);
+      continue;
+    }
+
+    out.push(msg);
+  }
+
+  if (changed) {
+    body.messages = out;
+    info("🧹 Sanitized tool_use/tool_result pairs");
+  }
+  return changed;
+}
+
+function rewriteModel(body) {
+  if (!body.model) return false;
+  const original = body.model;
+
+  for (const [pattern, bedrockModel] of Object.entries(MODEL_MAP)) {
+    if (body.model === pattern || body.model.includes(pattern)) {
+      body.model = bedrockModel;
+      if (pattern.includes("haiku")) {
+        info("🔀 Intercepting haiku → bedrock haiku");
+      } else if (pattern.includes("sonnet")) {
+        info("🔀 Intercepting sonnet → bedrock sonnet");
+      }
+      log(`Rewriting model: "${original}" → "${bedrockModel}"`);
+      return true;
+    }
+  }
+
+  info(`ℹ️  Model passthrough: ${original}`);
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
+const server = http.createServer((req, res) => {
+  log(`\n${new Date().toISOString()} ${req.method} ${req.url}`);
+
   const parsedUrl = url.parse(req.url, true);
   delete parsedUrl.query.beta;
-  delete parsedUrl.search; // Clear search to force regeneration from query
+  delete parsedUrl.search;
   const cleanPath = url.format(parsedUrl);
 
   let requestId = null;
-  let requestLogEntry = null;
   let responseStarted = false;
   let attempt = 0;
 
-  // Collect request body
-  let body = [];
-  req.on("data", (chunk) => {
-    body.push(chunk);
-  });
+  const chunks = [];
+  req.on("data", (chunk) => chunks.push(chunk));
 
   req.on("end", () => {
-    body = Buffer.concat(body);
-    const bodyStr = body.length > 0 ? body.toString() : "";
+    const rawBody = Buffer.concat(chunks);
+    let modifiedBody = rawBody;
+    let bodyModified = false;
     let parsedBodyJson = null;
 
-    // Parse and modify body if it contains a model field
-    let modifiedBody = body;
-    let modelRewritten = false;
-    let originalModel = null;
-    let newModel = null;
-
     if (
-      body.length > 0 &&
+      rawBody.length > 0 &&
       req.headers["content-type"]?.includes("application/json")
     ) {
       try {
-        parsedBodyJson = JSON.parse(bodyStr);
-        const bodyJson = parsedBodyJson;
+        parsedBodyJson = JSON.parse(rawBody.toString());
+        const body = parsedBodyJson;
 
-        // Log body in verbose mode
+        // Verbose / summary logging
         if (VERBOSE) {
-          log("Request body:", JSON.stringify(bodyJson, null, 2));
-        } else if (SUMMARY && Array.isArray(bodyJson.messages)) {
-          const messagesCount = bodyJson.messages.length;
-          const lastMessage = bodyJson.messages[messagesCount - 1];
-          let lastText = "";
-          if (lastMessage) {
-            if (typeof lastMessage.content === "string") {
-              lastText = lastMessage.content;
-            } else if (Array.isArray(lastMessage.content)) {
-              const textPart = lastMessage.content.find(
-                (item) =>
-                  item && item.type === "text" && typeof item.text === "string",
-              );
-              lastText = textPart?.text || "";
-            }
+          log("Request body:", JSON.stringify(body, null, 2));
+        } else if (SUMMARY && Array.isArray(body.messages)) {
+          const last = body.messages[body.messages.length - 1];
+          let preview = "";
+          if (typeof last?.content === "string") {
+            preview = last.content;
+          } else if (Array.isArray(last?.content)) {
+            const t = last.content.find(
+              (b) => b?.type === "text" && typeof b.text === "string",
+            );
+            preview = t?.text || "";
           }
-          const preview = lastText.slice(0, 50);
-          summary(`📝 Messages: ${messagesCount}, last preview: "${preview}"`);
+          summary(
+            `📝 Messages: ${body.messages.length}, last: "${preview.slice(0, 50)}"`,
+          );
         }
 
-        // Fix thinking.budget_tokens if it's >= max_tokens
-        if (bodyJson.thinking && bodyJson.thinking.budget_tokens) {
-          const maxTokens = bodyJson.max_tokens || 32000;
-          if (bodyJson.thinking.budget_tokens >= maxTokens) {
-            const oldBudget = bodyJson.thinking.budget_tokens;
-            // Set budget to 75% of max_tokens to leave room for response
-            bodyJson.thinking.budget_tokens = Math.floor(maxTokens * 0.75);
-            if (VERBOSE) {
-              log(
-                `Fixed thinking.budget_tokens: ${oldBudget} → ${bodyJson.thinking.budget_tokens} (max_tokens: ${maxTokens})`,
-              );
-            } else {
-              info(
-                `🧠 Fixed thinking budget: ${oldBudget} → ${bodyJson.thinking.budget_tokens}`,
-              );
-            }
-            modifiedBody = Buffer.from(JSON.stringify(bodyJson));
-            modelRewritten = true;
-          }
-        }
+        // Run all sanitisations (order matters for tool pairs)
+        const changed =
+          fixThinkingBudget(body) |
+          removeUnsupportedTopLevelFields(body) |
+          removeSystemCacheControl(body) |
+          removeToolDeferLoading(body) |
+          stripNonStandardContentBlocks(body) |
+          sanitizeToolPairs(body) |
+          rewriteModel(body);
 
-        // Remove unsupported fields
-        if (bodyJson.context_management) {
-          if (VERBOSE) {
-            log("Removing unsupported context_management field");
-          } else {
-            info("🧹 Removing context_management field");
-          }
-          delete bodyJson.context_management;
-          modifiedBody = Buffer.from(JSON.stringify(bodyJson));
-          modelRewritten = true;
-        }
-
-        // Remove unsupported cache_control fields from system messages
-        if (Array.isArray(bodyJson.system)) {
-          let removedCacheControl = false;
-          for (const entry of bodyJson.system) {
-            if (entry && entry.cache_control) {
-              delete entry.cache_control;
-              removedCacheControl = true;
-            }
-          }
-          if (removedCacheControl) {
-            if (VERBOSE) {
-              log("Removing unsupported system.cache_control fields");
-            } else {
-              info("🧹 Removing system cache_control fields");
-            }
-            modifiedBody = Buffer.from(JSON.stringify(bodyJson));
-            modelRewritten = true;
-          }
-        }
-
-        // Remove unsupported defer_loading field from tools payloads
-        if (Array.isArray(bodyJson.tools)) {
-          let removedDeferLoading = false;
-          for (const tool of bodyJson.tools) {
-            if (tool && "defer_loading" in tool) {
-              delete tool.defer_loading;
-              removedDeferLoading = true;
-            }
-            if (tool && tool.custom && "defer_loading" in tool.custom) {
-              delete tool.custom.defer_loading;
-              removedDeferLoading = true;
-            }
-          }
-          if (removedDeferLoading) {
-            if (VERBOSE) {
-              log("Removing unsupported tools defer_loading fields");
-            } else {
-              info("🧹 Removing tools defer_loading fields");
-            }
-            modifiedBody = Buffer.from(JSON.stringify(bodyJson));
-            modelRewritten = true;
-          }
-        }
-
-        // Remove unsupported tool_reference entries from tool_result content
-        if (Array.isArray(bodyJson.messages)) {
-          let removedToolReference = false;
-          for (const message of bodyJson.messages) {
-            if (!Array.isArray(message?.content)) {
-              continue;
-            }
-            const filteredContent = [];
-            for (const item of message.content) {
-              if (
-                item &&
-                item.type === "tool_result" &&
-                Array.isArray(item.content)
-              ) {
-                const filteredToolContent = item.content.filter(
-                  (toolItem) => toolItem && toolItem.type !== "tool_reference",
-                );
-                if (filteredToolContent.length !== item.content.length) {
-                  removedToolReference = true;
-                  if (filteredToolContent.length > 0) {
-                    item.content = filteredToolContent;
-                  } else {
-                    continue;
-                  }
-                }
-              }
-              filteredContent.push(item);
-            }
-            if (filteredContent.length !== message.content.length) {
-              message.content = filteredContent;
-            }
-          }
-          if (removedToolReference) {
-            if (VERBOSE) {
-              log(
-                "Removing unsupported tool_reference entries from tool_result content",
-              );
-            } else {
-              info(
-                "🧹 Removing tool_reference entries from tool_result content",
-              );
-            }
-            modifiedBody = Buffer.from(JSON.stringify(bodyJson));
-            modelRewritten = true;
-          }
-        }
-
-        // Remove assistant thinking blocks
-        if (Array.isArray(bodyJson.messages)) {
-          let removedThinking = false;
-          const filteredMessages = [];
-          for (const message of bodyJson.messages) {
-            if (
-              message?.role === "assistant" &&
-              Array.isArray(message.content)
-            ) {
-              const filteredContent = message.content.filter(
-                (item) => item && item.type !== "thinking",
-              );
-              if (filteredContent.length !== message.content.length) {
-                removedThinking = true;
-                message.content = filteredContent;
-              }
-              if (message.content.length === 0) {
-                removedThinking = true;
-                continue;
-              }
-            }
-            filteredMessages.push(message);
-          }
-          if (removedThinking) {
-            if (VERBOSE) {
-              log("Removing assistant thinking blocks");
-            } else {
-              info("🧹 Removing assistant thinking blocks");
-            }
-            bodyJson.messages = filteredMessages;
-            modifiedBody = Buffer.from(JSON.stringify(bodyJson));
-            modelRewritten = true;
-          }
-        }
-
-        // Ensure tool_use/tool_result pairs stay in sync
-        if (Array.isArray(bodyJson.messages)) {
-          const originalLength = bodyJson.messages.length;
-          const sanitizedMessages = [];
-          let removedToolPairs = false;
-
-          for (let i = 0; i < bodyJson.messages.length; i += 1) {
-            const message = bodyJson.messages[i];
-            if (
-              message?.role === "assistant" &&
-              Array.isArray(message.content)
-            ) {
-              const toolUseIds = message.content
-                .filter((item) => item && item.type === "tool_use" && item.id)
-                .map((item) => item.id);
-
-              if (toolUseIds.length > 0) {
-                const nextMessage = bodyJson.messages[i + 1];
-                const hasMatchingToolResult =
-                  nextMessage?.role === "user" &&
-                  Array.isArray(nextMessage.content) &&
-                  nextMessage.content.some(
-                    (item) =>
-                      item &&
-                      item.type === "tool_result" &&
-                      toolUseIds.includes(item.tool_use_id),
-                  );
-
-                if (!hasMatchingToolResult) {
-                  message.content = message.content.filter(
-                    (item) => item && item.type !== "tool_use",
-                  );
-                  removedToolPairs = true;
-                }
-              }
-
-              sanitizedMessages.push(message);
-              continue;
-            }
-
-            if (message?.role === "user" && Array.isArray(message.content)) {
-              const prevMessage = bodyJson.messages[i - 1];
-              const validToolUseIds = new Set(
-                prevMessage?.role === "assistant" &&
-                Array.isArray(prevMessage.content)
-                  ? prevMessage.content
-                      .filter(
-                        (item) => item && item.type === "tool_use" && item.id,
-                      )
-                      .map((item) => item.id)
-                  : [],
-              );
-
-              const hadToolResults = message.content.some(
-                (item) => item && item.type === "tool_result",
-              );
-
-              if (hadToolResults) {
-                const filteredContent = message.content.filter(
-                  (item) =>
-                    item &&
-                    (item.type !== "tool_result" ||
-                      (item.tool_use_id &&
-                        validToolUseIds.has(item.tool_use_id))),
-                );
-                if (filteredContent.length !== message.content.length) {
-                  removedToolPairs = true;
-                  message.content = filteredContent;
-                }
-              }
-
-              if (message.content.length === 0) {
-                removedToolPairs = true;
-                continue;
-              }
-
-              sanitizedMessages.push(message);
-              continue;
-            }
-
-            sanitizedMessages.push(message);
-          }
-
-          if (sanitizedMessages.length !== originalLength || removedToolPairs) {
-            if (VERBOSE) {
-              log("Sanitizing tool_use/tool_result pairs");
-            } else {
-              info("🧹 Sanitizing tool_use/tool_result pairs");
-            }
-            bodyJson.messages = sanitizedMessages;
-            modifiedBody = Buffer.from(JSON.stringify(bodyJson));
-            modelRewritten = true;
-          }
-        }
-
-        // Check if model needs rewriting
-        if (bodyJson.model) {
-          originalModel = bodyJson.model;
-
-          // Check if it matches any known pattern
-          for (const [pattern, bedrockModel] of Object.entries(MODEL_MAP)) {
-            if (
-              bodyJson.model.includes(pattern) ||
-              bodyJson.model === pattern
-            ) {
-              newModel = bedrockModel;
-              bodyJson.model = bedrockModel;
-              modifiedBody = Buffer.from(JSON.stringify(bodyJson));
-              modelRewritten = true;
-
-              // Simple log for non-verbose mode
-              if (pattern.includes("haiku")) {
-                info("🔀 Intercepting haiku → bedrock haiku");
-              } else if (pattern.includes("sonnet")) {
-                info("🔀 Intercepting sonnet → bedrock opus");
-              }
-
-              break;
-            }
-          }
-
-          if (VERBOSE && modelRewritten) {
-            log(`Rewriting model from "${originalModel}" to "${newModel}"`);
-          } else if (!modelRewritten) {
-            if (VERBOSE) {
-              log(`Model not rewritten: "${originalModel}"`);
-            } else {
-              info(`ℹ️ Model passthrough: ${originalModel}`);
-            }
-          }
+        if (changed) {
+          modifiedBody = Buffer.from(JSON.stringify(body));
+          bodyModified = true;
         }
       } catch (e) {
         log("Failed to parse body as JSON:", e.message);
       }
     }
 
+    // Request logging
     if (LOG_REQUESTS) {
       const timestamp = new Date().toISOString();
-      const safeTimestamp = timestamp.replace(/[:.]/g, "-");
       requestCounter += 1;
-      requestId = `${safeTimestamp}-${process.pid}-${requestCounter}`;
-      const logEntry = {
-        type: "request",
+      requestId = `${timestamp.replace(/[:.]/g, "-")}-${process.pid}-${requestCounter}`;
+      writeJsonlLog(
+        {
+          type: "request",
+          requestId,
+          timestamp,
+          method: req.method,
+          url: req.url,
+          cleanPath,
+          headers: req.headers,
+          originalBody: parsedBodyJson ?? rawBody.toString(),
+          forwardedBody: safeParseJson(modifiedBody.toString()),
+        },
         requestId,
-        timestamp,
-        method: req.method,
-        url: req.url,
-        cleanPath,
-        headers: req.headers,
-        originalBody: parsedBodyJson ?? bodyStr,
-        forwardedBody: safeParseJson(
-          modifiedBody.length > 0 ? modifiedBody.toString() : "",
-        ),
-      };
-      requestLogEntry = logEntry;
-      writeJsonlLog(requestLogEntry, requestId);
+      );
     }
 
-    // Log original headers (verbose only)
-    if (VERBOSE) {
-      log("Original headers:", JSON.stringify(req.headers, null, 2));
-    }
-
-    // Prepare headers for forwarding (strip problematic ones)
+    // Prepare forwarding headers
     const forwardHeaders = { ...req.headers };
-
-    // Remove beta-related headers
     delete forwardHeaders["anthropic-beta"];
-
-    // Update host header
     forwardHeaders.host = TARGET_HOST;
-
-    // Update content-length if body was modified
-    if (modifiedBody.length !== body.length) {
+    if (bodyModified) {
       forwardHeaders["content-length"] = modifiedBody.length;
     }
 
-    if (VERBOSE) {
-      log("Forwarding headers:", JSON.stringify(forwardHeaders, null, 2));
-      log("Clean path:", cleanPath);
-    }
+    log("Forwarding headers:", JSON.stringify(forwardHeaders, null, 2));
+    log("Clean path:", cleanPath);
 
-    // Forward request to LiteLLM
     const options = {
       hostname: TARGET_HOST,
       port: TARGET_PORT,
@@ -497,26 +420,15 @@ const server = http.createServer((req, res) => {
       attempt += 1;
 
       const proxyReq = https.request(options, (proxyRes) => {
-        if (VERBOSE) {
-          log(`Response status: ${proxyRes.statusCode}`);
-        }
-
+        log(`Response status: ${proxyRes.statusCode}`);
         responseStarted = true;
-
-        // Forward response headers
         res.writeHead(proxyRes.statusCode, proxyRes.headers);
-
-        // Stream response back
         proxyRes.pipe(res);
 
         if (LOG_REQUESTS) {
-          let responseChunks = [];
-          proxyRes.on("data", (chunk) => {
-            responseChunks.push(chunk);
-          });
-
+          const respChunks = [];
+          proxyRes.on("data", (c) => respChunks.push(c));
           proxyRes.on("end", () => {
-            const responseText = Buffer.concat(responseChunks).toString();
             writeJsonlLog(
               {
                 type: "response",
@@ -524,40 +436,28 @@ const server = http.createServer((req, res) => {
                 timestamp: new Date().toISOString(),
                 statusCode: proxyRes.statusCode,
                 headers: proxyRes.headers,
-                body: safeParseJson(responseText),
+                body: safeParseJson(Buffer.concat(respChunks).toString()),
               },
               requestId,
             );
           });
         }
 
-        // Log response for debugging
         if (VERBOSE) {
-          let responseBody = [];
-          proxyRes.on("data", (chunk) => {
-            responseBody.push(chunk);
-          });
-
+          const respChunks = [];
+          proxyRes.on("data", (c) => respChunks.push(c));
           proxyRes.on("end", () => {
-            const fullResponse = Buffer.concat(responseBody).toString();
             if (proxyRes.statusCode >= 400) {
-              log("Error response:", fullResponse);
+              log("Error response:", Buffer.concat(respChunks).toString());
             }
           });
         }
       });
 
       proxyReq.on("error", (err) => {
-        const shouldRetry =
-          !responseStarted && attempt <= MAX_RETRIES && isRetryableError(err);
-
-        if (shouldRetry) {
+        if (!responseStarted && attempt <= MAX_RETRIES && isRetryableError(err)) {
           const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
-          if (VERBOSE) {
-            log(
-              `Proxy request error (${err.code}); retrying in ${delay}ms (attempt ${attempt}/${MAX_RETRIES})`,
-            );
-          }
+          log(`Retrying in ${delay}ms (${err.code}, attempt ${attempt}/${MAX_RETRIES})`);
           setTimeout(sendProxyRequest, delay);
           return;
         }
@@ -567,17 +467,11 @@ const server = http.createServer((req, res) => {
           res.writeHead(502, { "Content-Type": "application/json" });
         }
         if (!res.writableEnded) {
-          res.end(
-            JSON.stringify({ error: "Proxy error", details: err.message }),
-          );
+          res.end(JSON.stringify({ error: "Proxy error", details: err.message }));
         }
       });
 
-      // Send the body (possibly modified)
-      if (modifiedBody.length > 0) {
-        proxyReq.write(modifiedBody);
-      }
-
+      if (modifiedBody.length > 0) proxyReq.write(modifiedBody);
       proxyReq.end();
     };
 
@@ -586,22 +480,19 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PROXY_PORT, () => {
-  console.log(`🔧 Proxy server listening on http://localhost:${PROXY_PORT}`);
-  console.log(`📡 Forwarding to https://${TARGET_HOST}:${TARGET_PORT}`);
-  console.log(`🧹 Stripping anthropic-beta headers and ?beta query params`);
-  if (LOG_REQUESTS) {
-    console.log(`🗃️  Request logging enabled: ${LOG_DIR}`);
-  }
-  console.log(`🗺️  Model mappings:`);
+  console.log(`Proxy listening on http://localhost:${PROXY_PORT}`);
+  console.log(`Forwarding to https://${TARGET_HOST}:${TARGET_PORT}`);
+  console.log(`Stripping anthropic-beta headers and ?beta query params`);
+  if (LOG_REQUESTS) console.log(`Request logging: ${LOG_DIR}/`);
+  console.log(`Model mappings:`);
   for (const [from, to] of Object.entries(MODEL_MAP)) {
-    console.log(`   ${from} → ${to}`);
+    console.log(`  ${from} → ${to}`);
   }
-  if (VERBOSE) {
-    console.log(`📢 Verbose mode enabled`);
-  } else if (SUMMARY) {
-    console.log(`🧾 Summary mode enabled`);
-  } else {
-    console.log(`💡 Run with --verbose or -v for detailed logs`);
-  }
+  console.log(
+    `Allowed content block types: ${[...ALLOWED_CONTENT_BLOCK_TYPES].join(", ")}`,
+  );
+  if (VERBOSE) console.log(`Verbose mode enabled`);
+  else if (SUMMARY) console.log(`Summary mode enabled`);
+  else console.log(`Run with --verbose or -v for detailed logs`);
   console.log();
 });
