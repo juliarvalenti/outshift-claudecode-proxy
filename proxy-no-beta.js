@@ -220,6 +220,183 @@ const server = http.createServer((req, res) => {
           }
         }
 
+        // Remove unsupported tool_reference entries from tool_result content
+        if (Array.isArray(bodyJson.messages)) {
+          let removedToolReference = false;
+          for (const message of bodyJson.messages) {
+            if (!Array.isArray(message?.content)) {
+              continue;
+            }
+            const filteredContent = [];
+            for (const item of message.content) {
+              if (
+                item &&
+                item.type === "tool_result" &&
+                Array.isArray(item.content)
+              ) {
+                const filteredToolContent = item.content.filter(
+                  (toolItem) => toolItem && toolItem.type !== "tool_reference",
+                );
+                if (filteredToolContent.length !== item.content.length) {
+                  removedToolReference = true;
+                  if (filteredToolContent.length > 0) {
+                    item.content = filteredToolContent;
+                  } else {
+                    continue;
+                  }
+                }
+              }
+              filteredContent.push(item);
+            }
+            if (filteredContent.length !== message.content.length) {
+              message.content = filteredContent;
+            }
+          }
+          if (removedToolReference) {
+            if (VERBOSE) {
+              log(
+                "Removing unsupported tool_reference entries from tool_result content",
+              );
+            } else {
+              info(
+                "🧹 Removing tool_reference entries from tool_result content",
+              );
+            }
+            modifiedBody = Buffer.from(JSON.stringify(bodyJson));
+            modelRewritten = true;
+          }
+        }
+
+        // Remove assistant thinking blocks
+        if (Array.isArray(bodyJson.messages)) {
+          let removedThinking = false;
+          const filteredMessages = [];
+          for (const message of bodyJson.messages) {
+            if (
+              message?.role === "assistant" &&
+              Array.isArray(message.content)
+            ) {
+              const filteredContent = message.content.filter(
+                (item) => item && item.type !== "thinking",
+              );
+              if (filteredContent.length !== message.content.length) {
+                removedThinking = true;
+                message.content = filteredContent;
+              }
+              if (message.content.length === 0) {
+                removedThinking = true;
+                continue;
+              }
+            }
+            filteredMessages.push(message);
+          }
+          if (removedThinking) {
+            if (VERBOSE) {
+              log("Removing assistant thinking blocks");
+            } else {
+              info("🧹 Removing assistant thinking blocks");
+            }
+            bodyJson.messages = filteredMessages;
+            modifiedBody = Buffer.from(JSON.stringify(bodyJson));
+            modelRewritten = true;
+          }
+        }
+
+        // Ensure tool_use/tool_result pairs stay in sync
+        if (Array.isArray(bodyJson.messages)) {
+          const originalLength = bodyJson.messages.length;
+          const sanitizedMessages = [];
+          let removedToolPairs = false;
+
+          for (let i = 0; i < bodyJson.messages.length; i += 1) {
+            const message = bodyJson.messages[i];
+            if (
+              message?.role === "assistant" &&
+              Array.isArray(message.content)
+            ) {
+              const toolUseIds = message.content
+                .filter((item) => item && item.type === "tool_use" && item.id)
+                .map((item) => item.id);
+
+              if (toolUseIds.length > 0) {
+                const nextMessage = bodyJson.messages[i + 1];
+                const hasMatchingToolResult =
+                  nextMessage?.role === "user" &&
+                  Array.isArray(nextMessage.content) &&
+                  nextMessage.content.some(
+                    (item) =>
+                      item &&
+                      item.type === "tool_result" &&
+                      toolUseIds.includes(item.tool_use_id),
+                  );
+
+                if (!hasMatchingToolResult) {
+                  message.content = message.content.filter(
+                    (item) => item && item.type !== "tool_use",
+                  );
+                  removedToolPairs = true;
+                }
+              }
+
+              sanitizedMessages.push(message);
+              continue;
+            }
+
+            if (message?.role === "user" && Array.isArray(message.content)) {
+              const prevMessage = bodyJson.messages[i - 1];
+              const validToolUseIds = new Set(
+                prevMessage?.role === "assistant" &&
+                Array.isArray(prevMessage.content)
+                  ? prevMessage.content
+                      .filter(
+                        (item) => item && item.type === "tool_use" && item.id,
+                      )
+                      .map((item) => item.id)
+                  : [],
+              );
+
+              const hadToolResults = message.content.some(
+                (item) => item && item.type === "tool_result",
+              );
+
+              if (hadToolResults) {
+                const filteredContent = message.content.filter(
+                  (item) =>
+                    item &&
+                    (item.type !== "tool_result" ||
+                      (item.tool_use_id &&
+                        validToolUseIds.has(item.tool_use_id))),
+                );
+                if (filteredContent.length !== message.content.length) {
+                  removedToolPairs = true;
+                  message.content = filteredContent;
+                }
+              }
+
+              if (message.content.length === 0) {
+                removedToolPairs = true;
+                continue;
+              }
+
+              sanitizedMessages.push(message);
+              continue;
+            }
+
+            sanitizedMessages.push(message);
+          }
+
+          if (sanitizedMessages.length !== originalLength || removedToolPairs) {
+            if (VERBOSE) {
+              log("Sanitizing tool_use/tool_result pairs");
+            } else {
+              info("🧹 Sanitizing tool_use/tool_result pairs");
+            }
+            bodyJson.messages = sanitizedMessages;
+            modifiedBody = Buffer.from(JSON.stringify(bodyJson));
+            modelRewritten = true;
+          }
+        }
+
         // Check if model needs rewriting
         if (bodyJson.model) {
           originalModel = bodyJson.model;
